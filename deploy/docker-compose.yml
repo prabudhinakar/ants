@@ -1,0 +1,22 @@
+name: ants
+# Ants world: one Node container. Caddy (in the haki stack on this VPS) proxies ants.ichiokuberry.in to it.
+# Run from ~/ants on the VPS:  docker compose -f deploy/docker-compose.yml up -d --build
+# The nest (state.json + daily backups) lives in the ants_data volume, separate from the code,
+# so rebuilding or updating the code never wipes it.
+services:
+  ants:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    volumes:
+      - ants_data:/data
+    networks: [web]
+
+volumes:
+  ants_data:
+
+networks:
+  web:
+    name: deploy_default
+    external: true
