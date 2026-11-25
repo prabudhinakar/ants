@@ -1,110 +1,129 @@
 'use strict';
-// Ants world server. Five ants live here: they wander the main page and the nest, take about
-// one word every 36 minutes each, and build a room with what they carry. The world keeps going
-// when nobody is watching. State is saved in DATA_DIR (a separate folder/volume), so updating
-// the code never wipes the nest.
+// Ants world server.
+// - Five resident bots live here. They move exactly like Nouria's ants (they follow an invisible
+//   "mouse"), wander the page and the nest on their own, take about one word every 36 minutes each
+//   and keep a room in the nest.
+// - Visitors get their own ant in the browser; it reports its position here (POST /act) and
+//   everyone receives all ants in a live stream (/events).
+// State is saved in DATA_DIR (a separate volume): updating the code never wipes the nest.
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
 const PORT = +process.env.PORT || 8080;
-const TS = +process.env.TIME_SCALE || 1;                       // only for testing: 60 = a minute passes in a second
+const TS = +process.env.TIME_SCALE || 1;                        // testing only: 60 = a minute passes in a second
 const MIN = 60000 / TS;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const PUB = process.env.PUBLIC_DIR || path.join(__dirname, '..', 'public');
-const PACE = +process.env.PACE_MS || 36 * 60 * 1000 / TS;      // average time between two words, per ant
-const REGROW = +process.env.REGROW_MS || 15 * 60 * 1000 / TS;  // a taken word is replaced after this
-const TRAIL_TTL = 10 * 60 * 1000;                              // walking trails fade
-const SCENT_TTL = 60 * 60 * 1000;                              // scent marks fade
+const PACE = +process.env.PACE_MS || 36 * 60 * 1000 / TS;       // average time between two words, per bot
+const REGROW = +process.env.REGROW_MS || 15 * 60 * 1000 / TS;   // a taken word is replaced after this
 const KEEP_BACKUPS = 14;
+const STATE_VERSION = 2;
 const SAVE_FILE = path.join(DATA_DIR, 'state.json');
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');
 
-const WW = 1600, HH = 900, SPLIT = 800;
-const PAGE = { x0: 50, x1: 755, y0: 40, y1: 880 };
-const NEST = { x0: 850, x1: 1560, y0: 40, y1: 880 };
-const PAGE_HOLE = { x: 735, y: 835 };
-const NEST_HOLE = { x: 885, y: 835 };
-const ROOM_R = 46;
-const COLORS = ['#c8553d', '#d9a441', '#d98e9a', '#f6dfd2', '#a8643a'];   // inside the palette
+const W = 1400, H = 850;                                        // one world, page or nest, as in Nouria's
+const HOLE = { x: 1300, y: 770, r: 24 };
+const ROOM_R = 38;
+const COLORS = ['#c8553d', '#d9a441', '#d98e9a', '#f6dfd2', '#a8643a'];   // the palette; rooms take these
+const MAX_VISITORS = 100, MAX_VROOMS = 40, MAX_ROOM_ITEMS = 80;
 
 const content = JSON.parse(fs.readFileSync(path.join(__dirname, 'content.json'), 'utf8'));
+const widths = JSON.parse(fs.readFileSync(path.join(__dirname, 'widths.json'), 'utf8'));   // Arial metrics
 const rnd = (a, b) => a + Math.random() * (b - a);
 const pick = arr => arr[Math.floor(Math.random() * arr.length)];
 const dist = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+function tw(str, size, bold) {
+  const t = bold ? widths.bold : widths.regular; let w = 0;
+  for (const ch of str) w += t[ch] || 556;
+  return w * size / 1000;
+}
 
 // ---------- the page: layout of the words ----------
-const words = [];                                  // { x, y, w, size }
+const words = [];                                  // { x, y, w, size, bold, t0 }
+let creditY = 0, pageHeight = 0;
 (function layout() {
-  const CW = 0.52;
-  let y = 110;
-  const add = (str, size) => {
-    let x = 60;
+  const LEFT = 90, RIGHT = 1010;
+  let y = 120;
+  const add = (str, size, bold) => {
+    let x = LEFT; const space = tw(' ', size, bold);
     for (const t of str.split(' ')) {
-      const w = t.length * size * CW;
-      if (x + w > 740) { x = 60; y += size * 1.55; }
-      words.push({ x: Math.round(x), y: Math.round(y), w: Math.round(w), size });
-      x += w + size * 0.32;
-      words[words.length - 1].t0 = t;
+      const w = tw(t, size, bold);
+      if (x + w > RIGHT) { x = LEFT; y += size * 1.5; }
+      words.push({ x: Math.round(x), y: Math.round(y), w: Math.round(w * 10) / 10, size, bold, t0: t });
+      x += w + space;
     }
-    y += size * 1.55;
+    y += size * 1.5;
   };
-  add(content.title, 36); y += 6;
-  for (const p of content.paragraphs) { add(p, 17); y += 12; }
+  add(content.title, 40, true); y += 8;
+  for (const p of content.paragraphs) { add(p, 21, false); y += 14; }
+  creditY = Math.round(y + 10);
+  pageHeight = creditY + 60;
 })();
 const N = words.length;
 
 // ---------- state ----------
-let S;   // { texts[], hiddenUntil[], dropped[], ants[], tunnels[], trails[], marks[] }
+let S;   // { v, texts[], hiddenUntil[], dropped[], bots[], tunnels[], vrooms{} }
+const visitors = new Map();                        // id -> { id, s, x, y, a, k, last }
+const dug = new Set();                             // grid cells already dug
+let fresh = { tunnels: [] };
+let version = 1, dirty = false;
 
-function freshState() {
-  const now = Date.now();
-  const st = {
-    texts: words.map(w => w.t0), hiddenUntil: new Array(N).fill(0), dropped: [],
-    ants: [], tunnels: [], trails: [], marks: [],
-  };
-  S = st;
-  COLORS.forEach((color, k) => {
-    const onPage = k < 3;
-    const reg = onPage ? PAGE : NEST;
-    const a = {
-      id: k, color, space: onPage ? 'page' : 'nest', x: rnd(reg.x0 + 40, reg.x1 - 40), y: rnd(reg.y0 + 120, reg.y1 - 200),
-      a: rnd(0, Math.PI * 2), room: null,
-      nextTake: now + rnd(1, 8) * MIN, leaveAt: now + rnd(2, 6) * MIN,
-    };
-    // a small starting room, so the nest is not empty on day one
-    const n = 2 + (k % 3);
-    for (let j = 0; j < n; j++) addItem(a, st, pick(content.pool), true);
-    st.ants.push(a);
-  });
-  return st;
+function dig(x, y) {
+  const key = Math.round(x / 4) + ',' + Math.round(y / 4);
+  if (dug.has(key)) return;
+  dug.add(key);
+  const s = [Math.round(x), Math.round(y)];
+  S.tunnels.push(s); fresh.tunnels.push(s); dirty = true;
+}
+function digLine(x1, y1, x2, y2) {
+  const n = Math.max(1, Math.ceil(dist(x1, y1, x2, y2) / 4));
+  for (let i = 0; i <= n; i++) dig(x1 + (x2 - x1) * i / n, y1 + (y2 - y1) * i / n);
 }
 
+function newBot(k) {
+  const web = k < 3, now = Date.now();
+  return {
+    id: 'bot' + k, color: COLORS[k], space: web ? 'web' : 'nest',
+    x: rnd(120, W - 120), y: rnd(120, web ? 760 : H - 140), angle: rnd(-Math.PI, Math.PI), step: 0,
+    carry: null, ready: true, room: null,
+    nextTake: now + rnd(1, 8) * MIN, leaveAt: now + rnd(2, 6) * MIN,
+  };
+}
+function freshState() {
+  S = { v: STATE_VERSION, texts: words.map(w => w.t0), hiddenUntil: new Array(N).fill(0), dropped: [], bots: [], tunnels: [], vrooms: {} };
+  dug.clear();
+  for (let a = 0; a < 7; a += 0.7) dig(HOLE.x + Math.cos(a) * 24, HOLE.y + Math.sin(a) * 24);   // a cavity around the hole
+  dig(HOLE.x, HOLE.y);
+  for (let k = 0; k < 5; k++) {
+    const b = newBot(k); S.bots.push(b);
+    const n = 2 + (k % 3);                         // a small starting room, so the nest is not empty on day one
+    for (let j = 0; j < n; j++) { const p = nextSlot(b); b.room.items.push({ t: pick(content.pool), x: p.x, y: p.y }); }
+  }
+}
 function load() {
   try {
     S = JSON.parse(fs.readFileSync(SAVE_FILE, 'utf8'));
-    if (!S.ants || S.texts.length !== N) throw new Error('state does not match the page');
-    for (const a of S.ants) { a.mode = 'wander'; a.carry = null; a.target = null; a.cross = null; }
+    if (S.v !== STATE_VERSION || S.texts.length !== N) throw new Error('old state version');
+    S.vrooms = S.vrooms || {};
+    dug.clear();
+    for (const s of S.tunnels) dug.add(Math.round(s[0] / 4) + ',' + Math.round(s[1] / 4));
     console.log('state loaded');
   } catch (e) {
-    if (e.code !== 'ENOENT') console.log('starting fresh:', e.message);
-    S = freshState();
+    if (e.code !== 'ENOENT') {
+      console.log('starting fresh:', e.message);
+      try { fs.mkdirSync(BACKUP_DIR, { recursive: true }); fs.copyFileSync(SAVE_FILE, path.join(BACKUP_DIR, 'state-before-reset-' + Date.now() + '.json')); } catch (_) {}
+    }
+    freshState();
   }
-  for (const a of S.ants) initRuntime(a);
+  for (const b of S.bots) { b.mode = 'wander'; b.carry = null; b.target = null; b.pauseUntil = 0; b.wi = -1; b.slot = null; b.ready = true; b.crossed = false; }
 }
-function initRuntime(a) {
-  a.mode = 'wander'; a.carry = null; a.target = null; a.cross = null; a.al = 1;
-  a.turnV = 0; a.pauseUntil = 0; a.lastTrail = { x: a.x, y: a.y }; a.lastStamp = { x: a.x, y: a.y };
-  a.slot = null; a.pendingWord = -1;
-}
-
-let version = 1, dirty = false;
 function save() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    const keep = S.ants.map(a => ({ id: a.id, color: a.color, space: a.space, x: a.x, y: a.y, a: a.a, room: a.room, nextTake: a.nextTake, leaveAt: a.leaveAt }));
-    const out = { ...S, ants: keep };
-    fs.writeFileSync(SAVE_FILE + '.tmp', JSON.stringify(out));
+    const keep = S.bots.map(b => ({ id: b.id, color: b.color, space: b.space, x: b.x, y: b.y, angle: b.angle, step: b.step, carry: null, ready: true, room: b.room, nextTake: b.nextTake, leaveAt: b.leaveAt }));
+    fs.writeFileSync(SAVE_FILE + '.tmp', JSON.stringify({ ...S, bots: keep }));
     fs.renameSync(SAVE_FILE + '.tmp', SAVE_FILE);
     dirty = false;
   } catch (e) { console.error('save failed', e.message); }
@@ -114,49 +133,52 @@ function dailyBackup() {
     fs.mkdirSync(BACKUP_DIR, { recursive: true });
     const f = path.join(BACKUP_DIR, 'state-' + new Date().toISOString().slice(0, 10) + '.json');
     if (!fs.existsSync(f) && fs.existsSync(SAVE_FILE)) fs.copyFileSync(SAVE_FILE, f);
-    const all = fs.readdirSync(BACKUP_DIR).filter(n => n.startsWith('state-')).sort();
+    const all = fs.readdirSync(BACKUP_DIR).filter(n => /^state-\d{4}-/.test(n)).sort();
     for (const n of all.slice(0, Math.max(0, all.length - KEEP_BACKUPS))) fs.unlinkSync(path.join(BACKUP_DIR, n));
   } catch (e) { console.error('backup failed', e.message); }
 }
 
 // ---------- rooms ----------
+function allRooms() { return [...S.bots.filter(b => b.room).map(b => b.room), ...Object.values(S.vrooms).map(v => v.room)]; }
 function roomCentre(self) {
   for (let i = 0; i < 80; i++) {
-    const x = rnd(NEST.x0 + 120, NEST.x1 - 120), y = rnd(NEST.y0 + 120, NEST.y1 - 140);
-    if (dist(x, y, NEST_HOLE.x, NEST_HOLE.y) < 200) continue;
-    if (S.ants.some(o => o !== self && o.room && dist(x, y, o.room.cx, o.room.cy) < 250)) continue;
+    const x = rnd(140, W - 140), y = rnd(120, H - 180);
+    if (dist(x, y, HOLE.x, HOLE.y) < 200) continue;
+    if (allRooms().some(r => r !== (self && self.room) && dist(x, y, r.cx, r.cy) < 230)) continue;
     return { x, y };
   }
-  return { x: rnd(NEST.x0 + 150, NEST.x1 - 150), y: rnd(NEST.y0 + 150, NEST.y1 - 150) };
+  return { x: rnd(160, W - 160), y: rnd(140, H - 200) };
 }
-// the spot where the next word will be stored
-function nextSlot(a, st) {
-  const S0 = st || S;
-  if (!a.room) { const c = roomCentre(a); a.room = { cx: c.x, cy: c.y, items: [] }; }
-  const r = a.room, n = r.items.length;
-  const R = 26 + 26 * Math.sqrt(n + 1);
+// the spot where the bot will drop its next word
+function nextSlot(b) {
+  if (!b.room) { const c = roomCentre(b); b.room = { cx: Math.round(c.x), cy: Math.round(c.y), items: [] }; }
+  const r = b.room, n = r.items.length, R = 24 + 20 * Math.sqrt(n + 1);
   let best = null;
   for (let i = 0; i < 40; i++) {
     const ang = rnd(0, Math.PI * 2), d = rnd(0, R);
     const p = { x: Math.round(r.cx + Math.cos(ang) * d), y: Math.round(r.cy + Math.sin(ang) * d) };
-    const gap = r.items.reduce((m, it) => Math.min(m, Math.hypot((p.x - it.x) / 3.2, p.y - it.y)), 999);
+    const gap = r.items.reduce((m, it) => Math.min(m, Math.hypot((p.x - it.x) / 3, p.y - it.y)), 999);
     if (!best || gap > best.gap) best = { ...p, gap };
   }
   return best;
 }
-function addItem(a, st, text, silent) {
-  const p = nextSlot(a, st);
-  a.room.items.push({ t: text, x: p.x, y: p.y, r: +rnd(-0.35, 0.35).toFixed(2) });
-  if (!silent) { S.dropped.push(text); if (S.dropped.length > 60) S.dropped.shift(); }
-}
 
 // ---------- words: taken, then replaced by another ----------
 function replacementFor(i) {
-  const cur = S.texts[i], len = words[i].t0.length;
-  const useDropped = S.dropped.length && Math.random() < 0.5;
-  const pool = (useDropped ? S.dropped : content.pool).filter(t => t !== cur && t.length <= len + 2 && t.length >= Math.max(2, len - 4));
-  const any = (useDropped ? S.dropped : content.pool).filter(t => t !== cur);
-  return pick(pool.length ? pool : any);
+  const cur = S.texts[i], w = words[i];
+  const fits = t => t !== cur && tw(t, w.size, w.bold) <= w.w * 1.15 + 6 && tw(t, w.size, w.bold) >= w.w * 0.4;
+  const first = S.dropped.length && Math.random() < 0.5 ? S.dropped : content.pool;
+  const second = first === content.pool ? S.dropped : content.pool;
+  const fit = first.filter(fits);
+  if (fit.length) return pick(fit);
+  const fit2 = second.filter(fits);
+  return fit2.length ? pick(fit2) : w.t0;              // nothing fits: the original word grows back
+}
+function takeWord(i) {
+  if (!(i >= 0 && i < N) || S.hiddenUntil[i]) return null;
+  const text = S.texts[i];
+  S.hiddenUntil[i] = Date.now() + REGROW; version++; dirty = true;
+  return text;
 }
 function visibleWords() {
   const out = [];
@@ -164,163 +186,166 @@ function visibleWords() {
   return out;
 }
 
-// ---------- ant behaviour ----------
-function angDiff(a, b) { let d = b - a; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return d; }
-function region(a) { return a.space === 'page' ? PAGE : NEST; }
-function holeOf(a) { return a.space === 'page' ? PAGE_HOLE : NEST_HOLE; }
-
-function steerTo(a, tx, ty, dt, speed, turn) {
-  const d = angDiff(a.a, Math.atan2(ty - a.y, tx - a.x));
-  a.a += Math.max(-turn * dt, Math.min(turn * dt, d));
-  a.x += Math.cos(a.a) * speed * dt; a.y += Math.sin(a.a) * speed * dt;
-}
-function wander(a, dt, now) {
-  if (now < a.pauseUntil) return;
-  if (Math.random() < dt * 0.04) { a.pauseUntil = now + rnd(2000, 7000); return; }   // a short rest
-  a.turnV = Math.max(-0.9, Math.min(0.9, a.turnV * 0.97 + (Math.random() - 0.5) * 3 * dt));
-  a.a += a.turnV * dt;
-  const g = region(a), m = 60;
-  if (a.x < g.x0 + m || a.x > g.x1 - m || a.y < g.y0 + m || a.y > g.y1 - m) {
-    const d = angDiff(a.a, Math.atan2((g.y0 + g.y1) / 2 - a.y, (g.x0 + g.x1) / 2 - a.x));
-    a.a += Math.max(-1.6 * dt, Math.min(1.6 * dt, d));
+// ---------- the bots: Nouria's ant, moved by an invisible mouse ----------
+function head(b) { return { x: b.x + Math.cos(b.angle) * 8, y: b.y + Math.sin(b.angle) * 8 }; }
+function followMouse(b, mx, my) {                  // the same rule as Nouria's Ant.update, once per frame
+  const d = dist(b.x, b.y, mx, my);
+  if (d > 3) {
+    const target = Math.atan2(my - b.y, mx - b.x);
+    b.angle += Math.atan2(Math.sin(target - b.angle), Math.cos(target - b.angle)) * 0.25;
+    const speed = Math.min(d * 0.08, 3);
+    b.x = clamp(b.x + Math.cos(b.angle) * speed, 10, W - 10);
+    b.y = clamp(b.y + Math.sin(b.angle) * speed, 10, b.space === 'web' ? pageHeight : H - 10);
+    b.step += speed * 0.5;
   }
-  a.x += Math.cos(a.a) * 24 * dt; a.y += Math.sin(a.a) * 24 * dt;
+  if (b.space === 'nest') dig(b.x, b.y);
+  const dh = dist(b.x, b.y, HOLE.x, HOLE.y);       // pass through the hole
+  if (dh > HOLE.r + 6) b.ready = true;
+  if (b.ready && dh < HOLE.r) { b.space = b.space === 'web' ? 'nest' : 'web'; b.ready = false; b.crossed = true; }
 }
-
-function addMark(a, kind) {
-  S.marks.push([Math.round(a.x), Math.round(a.y), Date.now(), a.space === 'page' ? 0 : 1, a.id]);
-  fresh.marks.push(S.marks[S.marks.length - 1]);
+function newTarget(b) {
+  if (b.space === 'nest' && b.room && Math.random() < 0.7) return { x: clamp(b.room.cx + rnd(-150, 150), 30, W - 30), y: clamp(b.room.cy + rnd(-130, 130), 30, H - 30) };
+  return { x: rnd(40, W - 40), y: rnd(40, b.space === 'web' ? Math.min(pageHeight - 40, 800) : H - 40) };
 }
-
-function stepAnt(a, dt, now) {
-  const g = region(a);
-  switch (a.mode) {
+function botFrame(b, now) {
+  switch (b.mode) {
     case 'wander': {
-      if (a.space === 'page' && now >= a.nextTake) {
+      if (b.space === 'web' && now >= b.nextTake) {
         const vis = visibleWords();
-        if (vis.length) {
-          const i = pick(vis), w = words[i];
-          a.pendingWord = i; a.target = { x: w.x + w.w / 2, y: w.y - w.size * 0.3 }; a.mode = 'toWord'; break;
-        }
+        if (vis.length) { b.wi = pick(vis); b.mode = 'toWord'; break; }
       }
-      if (a.space === 'nest' && (now >= a.leaveAt || now >= a.nextTake)) { a.mode = 'toHole'; a.after = 'up'; break; }
-      wander(a, dt, now); break;
+      if (b.space === 'nest' && (now >= b.leaveAt || now >= b.nextTake)) { b.mode = 'toHole'; b.crossed = false; break; }
+      if (now < b.pauseUntil) break;
+      if (!b.target) b.target = newTarget(b);
+      followMouse(b, b.target.x, b.target.y);
+      if (dist(b.x, b.y, b.target.x, b.target.y) < 8) { b.target = null; b.pauseUntil = now + rnd(1000, 6000); }
+      break;
     }
     case 'toWord': {
-      steerTo(a, a.target.x, a.target.y, dt, 58, 3.2);
-      if (dist(a.x, a.y, a.target.x, a.target.y) < 7) {
-        const i = a.pendingWord;
-        if (S.hiddenUntil[i]) { a.mode = 'wander'; a.nextTake = now + 5000; break; }    // somebody else took it
-        a.carry = S.texts[i]; S.hiddenUntil[i] = now + REGROW; a.pendingWord = -1;
-        addMark(a); version++; dirty = true;
-        a.mode = 'toHole'; a.after = 'down';
+      const w = words[b.wi];
+      if (S.hiddenUntil[b.wi]) { b.mode = 'wander'; b.nextTake = now + 5000; break; }      // somebody else took it
+      followMouse(b, w.x + w.w / 2, w.y - w.size * 0.3);
+      const h = head(b);
+      if (h.x > w.x && h.x < w.x + w.w && h.y > w.y - w.size && h.y < w.y + 3) {
+        const t = takeWord(b.wi);
+        if (t) { b.carry = t; b.mode = 'toHole'; b.crossed = false; } else { b.mode = 'wander'; b.nextTake = now + 5000; }
       }
       break;
     }
     case 'toHole': {
-      const h = holeOf(a);
-      steerTo(a, h.x, h.y, dt, a.carry ? 52 : 46, 3);
-      if (dist(a.x, a.y, h.x, h.y) < 8) { a.mode = 'cross'; a.cross = { start: now, moved: false, up: a.space === 'nest' }; }
-      break;
-    }
-    case 'cross': {
-      const p = (now - a.cross.start) / 1500;
-      if (p < 0.5) { a.al = 1 - 2 * p; }
-      else {
-        if (!a.cross.moved) {
-          a.cross.moved = true;
-          if (a.cross.up) { a.space = 'page'; a.x = PAGE_HOLE.x; a.y = PAGE_HOLE.y; a.a = rnd(Math.PI, Math.PI * 1.5); }
-          else { a.space = 'nest'; a.x = NEST_HOLE.x; a.y = NEST_HOLE.y; a.a = rnd(-0.5, 0.5); }
-          a.lastTrail = { x: a.x, y: a.y }; a.lastStamp = { x: a.x, y: a.y };
-          if (!a.cross.up && a.carry) a.slot = nextSlot(a);
-          if (!a.cross.up) a.slot = a.carry ? a.slot : null;
-        }
-        a.al = Math.min(1, 2 * p - 1);
-      }
-      if (p >= 1) {
-        a.al = 1; a.cross = null;
-        if (a.space === 'nest' && a.carry) { a.mode = 'toRoom'; a.target = a.slot; }
-        else { a.mode = 'wander'; if (a.space === 'nest') a.leaveAt = now + rnd(3, 9) * MIN; }
+      followMouse(b, HOLE.x, HOLE.y);
+      if (b.crossed) {
+        b.crossed = false;
+        if (b.space === 'nest' && b.carry) { b.slot = nextSlot(b); b.mode = 'toRoom'; }
+        else { b.mode = 'wander'; b.target = null; b.pauseUntil = 0; if (b.space === 'nest') b.leaveAt = now + rnd(3, 9) * MIN; }
       }
       break;
     }
     case 'toRoom': {
-      steerTo(a, a.target.x, a.target.y, dt, 50, 3);
-      if (dist(a.x, a.y, a.target.x, a.target.y) < 7) {
-        a.room.items.push({ t: a.carry, x: a.target.x, y: a.target.y, r: +rnd(-0.35, 0.35).toFixed(2) });
-        S.dropped.push(a.carry); if (S.dropped.length > 60) S.dropped.shift();
-        a.carry = null; a.slot = null; a.target = null;
-        a.nextTake = now + PACE * rnd(0.6, 1.4); a.leaveAt = now + rnd(3, 9) * MIN;
-        a.mode = 'wander'; version++; dirty = true;
+      followMouse(b, b.slot.x, b.slot.y);
+      const h = head(b);
+      if (dist(h.x, h.y, b.slot.x, b.slot.y) < 7 || dist(b.x, b.y, b.slot.x, b.slot.y) < 7) {
+        b.room.items.push({ t: b.carry, x: b.slot.x, y: b.slot.y });
+        S.dropped.push(b.carry); if (S.dropped.length > 60) S.dropped.shift();
+        b.carry = null; b.slot = null; b.target = null;
+        b.nextTake = now + PACE * rnd(0.6, 1.4); b.leaveAt = now + rnd(3, 9) * MIN;
+        b.mode = 'wander'; version++; dirty = true;
       }
       break;
     }
   }
 }
 
+// ---------- visitors ----------
+function colorFor(id) { let h = 0; for (const c of id) h = (h * 31 + c.charCodeAt(0)) >>> 0; return COLORS[h % COLORS.length]; }
+function handleAct(m) {
+  const id = typeof m.id === 'string' ? m.id.slice(0, 16).replace(/[^\w-]/g, '') : '';
+  if (!id) return { ok: false };
+  const now = Date.now();
+  let v = visitors.get(id);
+  const num = (x, a, b) => typeof x === 'number' && isFinite(x) ? clamp(x, a, b) : null;
+  if (m.kind === 'pos') {
+    const x = num(m.x, 0, W), y = num(m.y, 0, pageHeight + 50), a = num(m.a, -10, 10);
+    if (x === null || y === null || a === null || (m.s !== 'web' && m.s !== 'nest')) return { ok: false };
+    if (!v) { if (visitors.size >= MAX_VISITORS) return { ok: false }; v = { id }; visitors.set(id, v); }
+    if (m.s === 'nest' && v.s === 'nest' && dist(v.x, v.y, x, y) < 90) digLine(v.x, v.y, x, y);
+    else if (m.s === 'nest') dig(x, y);
+    Object.assign(v, { s: m.s, x, y, a, k: typeof m.k === 'string' ? m.k.slice(0, 24) : null, last: now });
+    return { ok: true };
+  }
+  if (!v) return { ok: false };
+  if (m.kind === 'take') {
+    const t = takeWord(m.i | 0);
+    return t ? { ok: true, text: t } : { ok: false };
+  }
+  if (m.kind === 'drop') {
+    const x = num(m.x, 0, W), y = num(m.y, 0, H);
+    const text = typeof m.text === 'string' ? m.text.slice(0, 24) : '';
+    if (x === null || y === null || !text) return { ok: false };
+    let vr = S.vrooms[id];
+    if (!vr) {
+      const keys = Object.keys(S.vrooms);
+      if (keys.length >= MAX_VROOMS) delete S.vrooms[keys.sort((p, q) => S.vrooms[p].last - S.vrooms[q].last)[0]];
+      vr = S.vrooms[id] = { c: colorFor(id), last: now, room: { cx: Math.round(x), cy: Math.round(y), items: [] } };
+    }
+    vr.last = now;
+    vr.room.items.push({ t: text, x: Math.round(x), y: Math.round(y) });
+    if (vr.room.items.length > MAX_ROOM_ITEMS) vr.room.items.shift();
+    S.dropped.push(text); if (S.dropped.length > 60) S.dropped.shift();
+    version++; dirty = true;
+    return { ok: true };
+  }
+  return { ok: false };
+}
+
 // ---------- the loop ----------
-let fresh = { tunnels: [], trails: [], marks: [] };
 const clients = new Set();
-let last = Date.now();
+let last = Date.now(), lastBroadcast = 0;
 
 function tick() {
   const now = Date.now(), dt = Math.min(0.25, (now - last) / 1000); last = now;
-
-  // words that were taken long enough ago are replaced by a different word
-  for (let i = 0; i < N; i++) {
+  for (let i = 0; i < N; i++) {                    // taken long enough ago: a different word grows there
     if (S.hiddenUntil[i] && S.hiddenUntil[i] <= now) { S.texts[i] = replacementFor(i); S.hiddenUntil[i] = 0; version++; dirty = true; }
   }
-
-  for (const a of S.ants) {
-    const px = a.x, py = a.y;
-    stepAnt(a, dt, now);
-    if (a.mode === 'cross') continue;
-    // ants do not overlap: they push each other softly apart
-    for (const o of S.ants) {
-      if (o === a || o.space !== a.space || o.mode === 'cross') continue;
-      const d = dist(a.x, a.y, o.x, o.y);
-      if (d < 30 && d > 0.01) { const k = (30 - d) * 0.25; a.x += (a.x - o.x) / d * k; a.y += (a.y - o.y) / d * k; a.a += angDiff(a.a, Math.atan2(a.y - o.y, a.x - o.x)) * 0.05; }
-    }
-    // walking trails (10 min) and dug tunnels (stay)
-    if (dist(a.x, a.y, a.lastTrail.x, a.lastTrail.y) > 26) {
-      const t = [Math.round(a.x), Math.round(a.y), now, a.space === 'page' ? 0 : 1, a.id];
-      S.trails.push(t); fresh.trails.push(t); a.lastTrail = { x: a.x, y: a.y };
-    }
-    if (a.space === 'nest' && dist(a.x, a.y, a.lastStamp.x, a.lastStamp.y) > 13) {
-      const s = [Math.round(a.x), Math.round(a.y)];
-      S.tunnels.push(s); fresh.tunnels.push(s); a.lastStamp = { x: a.x, y: a.y }; dirty = true;
+  const frames = Math.max(1, Math.round(dt * 60));
+  for (const b of S.bots) {
+    for (let f = 0; f < frames; f++) botFrame(b, now);
+    for (const o of S.bots) {                      // ants do not overlap: a bot gives way to a close ant in its space
+      if (o === b || o.space !== b.space) continue;
+      const d = dist(b.x, b.y, o.x, o.y);
+      if (d < 16 && d > 0.01) { b.x += (b.x - o.x) / d * 0.8; b.y += (b.y - o.y) / d * 0.8; }
     }
   }
-  if (S.tunnels.length > 9000) S.tunnels.splice(0, S.tunnels.length - 9000);
-  const cutT = now - TRAIL_TTL, cutM = now - SCENT_TTL;
-  while (S.trails.length && S.trails[0][2] < cutT) S.trails.shift();
-  while (S.marks.length && S.marks[0][2] < cutM) S.marks.shift();
-
-  broadcast(now);
+  for (const [id, v] of visitors) if (now - v.last > 6000) visitors.delete(id);
+  if (now - lastBroadcast >= 95) { lastBroadcast = now; broadcast(); }
 }
 
-function antView(a) {
-  return { id: a.id, c: a.color, s: a.space === 'page' ? 0 : 1, x: +a.x.toFixed(1), y: +a.y.toFixed(1), a: +a.a.toFixed(2), al: +a.al.toFixed(2), k: a.carry, p: a.mode === 'wander' && Date.now() < a.pauseUntil ? 1 : 0 };
+function antViews() {
+  const out = S.bots.map(b => ({ id: b.id, s: b.space, x: +b.x.toFixed(1), y: +b.y.toFixed(1), a: +b.angle.toFixed(3), k: b.carry }));
+  for (const v of visitors.values()) out.push({ id: v.id, s: v.s, x: v.x, y: v.y, a: v.a, k: v.k });
+  return out;
 }
 function worldView() {
-  return { v: version, texts: S.texts, hidden: S.hiddenUntil.map(x => x ? 1 : 0), rooms: S.ants.map(a => ({ id: a.id, c: a.color, room: a.room })) };
+  const rooms = [];
+  for (const b of S.bots) if (b.room) rooms.push({ c: b.color, room: b.room });
+  for (const v of Object.values(S.vrooms)) rooms.push({ c: v.c, room: v.room });
+  return { v: version, texts: S.texts, hidden: S.hiddenUntil.map(x => x ? 1 : 0), rooms };
+}
+function initMsg() {
+  return { W, H, hole: HOLE, pageHeight, creditY, words, credit: content.credit, roomR: ROOM_R, tunnels: S.tunnels };
 }
 let lastSentVersion = 0;
 function send(res, event, data) { res.write('event: ' + event + '\ndata: ' + JSON.stringify(data) + '\n\n'); }
-function broadcast(now) {
-  if (!clients.size) { fresh = { tunnels: [], trails: [], marks: [] }; return; }
-  const tickMsg = { t: now, ants: S.ants.map(antView), nt: fresh.tunnels, nr: fresh.trails, nm: fresh.marks };
-  fresh = { tunnels: [], trails: [], marks: [] };
+function broadcast() {
+  if (!clients.size) { fresh = { tunnels: [] }; return; }
+  const msg = { ants: antViews(), nt: fresh.tunnels };
+  fresh = { tunnels: [] };
   const w = version !== lastSentVersion ? worldView() : null;
   lastSentVersion = version;
-  for (const res of clients) { if (w) send(res, 'world', w); send(res, 'tick', tickMsg); }
+  for (const res of clients) { if (w) send(res, 'world', w); send(res, 'tick', msg); }
 }
 
 // ---------- http ----------
-function initMsg() {
-  return { t: Date.now(), W: WW, H: HH, split: SPLIT, words, credit: content.credit, pageHole: PAGE_HOLE, nestHole: NEST_HOLE, roomR: ROOM_R,
-    trailTtl: TRAIL_TTL, scentTtl: SCENT_TTL, tunnels: S.tunnels, trails: S.trails, marks: S.marks };
-}
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json', '.png': 'image/png', '.svg': 'image/svg+xml', '.ico': 'image/x-icon' };
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
@@ -332,12 +357,23 @@ const server = http.createServer((req, res) => {
     req.on('close', () => clients.delete(res));
     return;
   }
+  if (url.pathname === '/act' && req.method === 'POST') {
+    let body = '';
+    req.on('data', c => { body += c; if (body.length > 2000) req.destroy(); });
+    req.on('end', () => {
+      let out = { ok: false };
+      try { out = handleAct(JSON.parse(body)); } catch (_) {}
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(out));
+    });
+    return;
+  }
   if (url.pathname === '/snapshot') {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
-    res.end(JSON.stringify({ init: initMsg(), world: worldView(), tick: { t: Date.now(), ants: S.ants.map(antView), nt: [], nr: [], nm: [] } })); return;
+    res.end(JSON.stringify({ init: initMsg(), world: worldView(), tick: { ants: antViews(), nt: [] } })); return;
   }
   if (url.pathname === '/health') { res.writeHead(200); res.end('ok'); return; }
-  let f = url.pathname === '/' ? '/index.html' : decodeURIComponent(url.pathname);
+  const f = url.pathname === '/' ? '/index.html' : decodeURIComponent(url.pathname);
   const file = path.normalize(path.join(PUB, f));
   if (!file.startsWith(PUB)) { res.writeHead(403); res.end(); return; }
   fs.readFile(file, (err, buf) => {
@@ -348,7 +384,7 @@ const server = http.createServer((req, res) => {
 });
 
 load(); save(); dailyBackup();
-setInterval(tick, 100);
+setInterval(tick, 50);
 setInterval(() => { if (dirty) save(); }, 15000);
 setInterval(() => { for (const r of clients) r.write(': keep-alive\n\n'); }, 20000);
 setInterval(dailyBackup, 6 * 3600 * 1000);
