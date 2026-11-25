@@ -305,10 +305,14 @@ function botFrame(b, now) {
 // ---------- visitors ----------
 const SPACES = ['web', 'nest', 'B', 'C'];
 function colorFor(id) { let h = 0; for (const c of id) h = (h * 31 + c.charCodeAt(0)) >>> 0; return COLORS[h % COLORS.length]; }
+const TEX = ['sand', 'pebble', 'moss', 'clay'];
+const BOT_C = ['#c8553d', '#d9a441', '#d98e9a', '#2a9d8f', '#a8643a'];
+const BOT_LOOKS = [{ t: 'scout', sz: 0.85 }, { t: 'carrier', sz: 1.3, pt: 'stripes' }, { t: 'digger', sz: 1.15, st: 1 }, { sz: 1, pt: 'dots', gl: 1 }, { t: 'scout', sz: 1.45, pt: 'stripes' }];
+const botLook = b => { const k = +b.id.slice(3) || 0, l = BOT_LOOKS[k % BOT_LOOKS.length]; return { t: l.t || null, c: BOT_C[k % 5], sz: l.sz, gl: l.gl || 0, st: l.st || 0, pt: l.pt || null }; };
 const isHex = c => typeof c === 'string' && /^#[0-9a-fA-F]{6}$/.test(c);
 function cleanLook(l) {
   if (!l || typeof l !== 'object') return null;
-  return { t: ['scout', 'carrier', 'digger'].includes(l.t) ? l.t : null, c: isHex(l.c) ? l.c : null, sz: clamp(+l.sz || 1, 0.6, 1.8), gl: l.gl ? 1 : 0, st: l.st ? 1 : 0, pt: ['stripes', 'dots'].includes(l.pt) ? l.pt : null };
+  return { t: ['scout', 'carrier', 'digger'].includes(l.t) ? l.t : null, c: isHex(l.c) ? l.c : null, sz: clamp(+l.sz || 1, 0.6, 1.8), gl: l.gl ? 1 : 0, st: l.st ? 1 : 0, pt: ['stripes', 'dots'].includes(l.pt) ? l.pt : null, tx: TEX.includes(l.tx) ? l.tx : null };
 }
 function cleanItem(it) {                           // what an ant can carry and store: a word, a cut-out word or a cut picture
   if (typeof it === 'string') return it ? { t: it.slice(0, 40) } : null;
@@ -337,7 +341,7 @@ function handleAct(m) {
     if ((m.s === 'web' || nest) && dist(v.lastTrail.x, v.lastTrail.y, x, y) > 26) { addTrail(x, y, nest ? 1 : 0); v.lastTrail = { x, y }; }
     const gone = v.s && v.s !== m.s;
     Object.assign(v, { s: m.s, p: typeof m.p === 'string' ? m.p.slice(0, 20) : '', x, y, a, k: viewCarry(cleanItem(m.k && m.k.length !== undefined && typeof m.k !== 'string' ? m.k[0] : m.k)), kn: Array.isArray(m.k) ? m.k.length : (m.k ? 1 : 0), look, last: now });
-    if (v.look && v.look.c && S.vrooms[id] && S.vrooms[id].c !== v.look.c) { S.vrooms[id].c = v.look.c; bump(); }
+    if (v.look && S.vrooms[id] && ((v.look.c && S.vrooms[id].c !== v.look.c) || (S.vrooms[id].tx || null) !== v.look.tx)) { if (v.look.c) S.vrooms[id].c = v.look.c; S.vrooms[id].tx = v.look.tx; bump(); }
     const inbox = v.inbox; v.inbox = [];
     return { ok: true, inbox };
   }
@@ -353,7 +357,7 @@ function handleAct(m) {
     if (!vr) {
       const keys = Object.keys(S.vrooms);
       if (keys.length >= MAX_VROOMS) delete S.vrooms[keys.sort((p, q) => S.vrooms[p].last - S.vrooms[q].last)[0]];
-      vr = S.vrooms[id] = { c: (v.look && v.look.c) || colorFor(id), last: now, room: { cx: Math.round(x), cy: Math.round(y), items: [] } };
+      vr = S.vrooms[id] = { c: (v.look && v.look.c) || colorFor(id), tx: (v.look && v.look.tx) || null, last: now, room: { cx: Math.round(x), cy: Math.round(y), items: [] } };
     }
     vr.last = now;
     vr.room.items.push({ ...item, x: Math.round(x), y: Math.round(y) });
@@ -361,6 +365,17 @@ function handleAct(m) {
     if (item.t) dropped(item.t);
     bump();
     return { ok: true };
+  }
+  if (m.kind === 'pick') {                         // the owner picks up a stored word to move it
+    const vr = S.vrooms[id], x = num(m.x, 0, NW), y = num(m.y, 0, NH);
+    if (!vr || x === null || y === null) return { ok: false };
+    let bi = -1, bd = 30;
+    vr.room.items.forEach((it, i) => { const d = dist(it.x, it.y, x, y); if (d < bd) { bd = d; bi = i; } });
+    if (bi < 0) return { ok: false };
+    const it = vr.room.items.splice(bi, 1)[0]; delete it.x; delete it.y;
+    if (!vr.room.items.length) delete S.vrooms[id]; else vr.last = now;
+    bump();
+    return { ok: true, item: it };
   }
   if (m.kind === 'eat') {                          // an ant eats a word it stored itself
     const vr = S.vrooms[id], x = num(m.x, 0, NW), y = num(m.y, 0, NH);
@@ -539,15 +554,15 @@ function tick() {
 }
 
 function antViews() {
-  const out = S.bots.map(b => ({ id: b.id, s: b.space, x: +b.x.toFixed(1), y: +b.y.toFixed(1), a: +b.angle.toFixed(3), k: b.carry }));
+  const out = S.bots.map(b => ({ id: b.id, s: b.space, x: +b.x.toFixed(1), y: +b.y.toFixed(1), a: +b.angle.toFixed(3), k: b.carry, l: botLook(b) }));
   for (const v of visitors.values()) out.push({ id: v.id, s: v.s, p: v.p, x: v.x, y: v.y, a: v.a, k: v.k, l: v.look });
   for (const g of ghosts) out.push({ id: g.id, s: g.s, p: g.p, x: g.x, y: g.y, a: g.a, g: 1 });
   return out;
 }
 function worldView() {
   const rooms = [];
-  for (const b of S.bots) if (b.room) rooms.push({ o: b.id, c: b.color, room: b.room });
-  for (const [id, v] of Object.entries(S.vrooms)) rooms.push({ o: id, c: v.c, room: v.room });
+  for (const b of S.bots) if (b.room) rooms.push({ o: b.id, c: b.color, tx: [null, 'sand', 'pebble', 'moss', 'clay'][(+b.id.slice(3) || 0) % 5], room: b.room });
+  for (const [id, v] of Object.entries(S.vrooms)) rooms.push({ o: id, c: v.c, tx: v.tx || null, room: v.room });
   return { v: version, texts: S.texts, hidden: S.hiddenUntil.map(x => x ? 1 : 0), rooms };
 }
 function initMsg() {

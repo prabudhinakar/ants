@@ -16,10 +16,14 @@
   #bar button:hover { background: #f6dfd2; }
   #crumbs { margin-top: 6px; font-size: 11px; color: #a0705a; }
   #crumbs span { cursor: pointer; text-decoration: underline; margin: 0 3px; }
+  #pad { position: fixed; right: 8px; bottom: 8px; display: none; flex-wrap: wrap; gap: 6px; width: 190px; justify-content: flex-end; z-index: 6; }
+  #pad button { width: 56px; height: 44px; border: 1px solid #c99a86; background: rgba(40,18,6,0.78); color: #f6dfd2; font: 12px Helvetica, Arial, sans-serif; border-radius: 6px; touch-action: none; user-select: none; -webkit-user-select: none; }
+  #pad button.on { background: #c8553d; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
+<div id="pad"><button data-k="shift" data-hold="1">boost</button><button data-k="f" data-hold="1">follow</button><button data-k="s">scent</button><button data-k="q">call</button><button data-k="g">give</button><button data-k="e">eat</button><button data-k="m">sound</button></div>
 <div id="bar">
   <div class="row"><input id="q" placeholder="search the web, or paste a link" autocomplete="off" spellcheck="false"><button id="go">go</button><button id="rnd">random</button></div>
   <div id="crumbs"></div>
@@ -51,8 +55,8 @@ let MY_ID = store.get('antId', null);
 if (!MY_ID) { MY_ID = Math.random().toString(36).slice(2, 10); store.set('antId', MY_ID); }
 let tokens = store.get('antTokens', 0);
 if (Q.get('tokens')) tokens = +Q.get('tokens') || 0;
-let look = store.get('antLook', { t: null, c: null, sz: 1, gl: 0, st: 0, pt: null });
-let owned = store.get('antOwned', ['type:ant', 'col:black', 'size:1']);
+let look = store.get('antLook', { t: null, c: null, sz: 1, gl: 0, st: 0, pt: null, tx: null });
+let owned = store.get('antOwned', ['type:ant', 'col:black', 'size:1', 'tx:stone']);
 const saveMe = () => { store.set('antTokens', tokens); store.set('antLook', look); store.set('antOwned', owned); };
 
 // ---------- sound (starts at the first click) ----------
@@ -92,12 +96,39 @@ function drawItem(g, it, x, y, size, alpha, space) {
     g.font = size + 'px ' + FONT; g.textBaseline = 'middle';
     const tw = g.measureText(it.t).width;
     if (it.bg) { g.fillStyle = it.bg; g.fillRect(x - tw / 2 - 4, y - size * 0.8, tw + 8, size * 1.6); g.strokeStyle = '#2b1004'; g.lineWidth = it.bw || 2; g.strokeRect(x - tw / 2 - 4, y - size * 0.8, tw + 8, size * 1.6); g.fillStyle = '#2b1004'; }
-    else g.fillStyle = space === 'web' || space === 'B' ? RED : LIGHT;
+    else g.fillStyle = space === 'room' ? '#2b1004' : space === 'web' || space === 'B' || space === 'C' ? RED : LIGHT;
     g.textAlign = 'center'; g.fillText(it.t, x, y);
   }
   g.restore();
 }
-function drawRooms() {                                   // a lighter boundary around the words an ant keeps
+const mix = (a, b, k) => { const x = parseInt(a.slice(1), 16), y = parseInt(b.slice(1), 16), f = (sh) => Math.round(((x >> sh) & 255) * (1 - k) + ((y >> sh) & 255) * k); return '#' + ((1 << 24) + (f(16) << 16) + (f(8) << 8) + f(0)).toString(16).slice(1); };
+const TEXBASE = { stone: '#bba892', sand: '#e6d2a4', pebble: '#c9b9a8', moss: '#a8b88a', clay: '#d29c7c' };
+const texCache = {};
+function texPattern(name) {                              // the floor of a cave: each texture is drawn once and repeated
+  name = name || 'stone'; if (texCache[name]) return texCache[name];
+  const T = layer(96, 96), g = T.getContext('2d'); let sd = name.length * 977 + name.charCodeAt(0);
+  const r = () => (sd = (sd * 16807) % 2147483647) / 2147483647;
+  const dot = (col, a, n, lo, hi) => { g.fillStyle = col; g.globalAlpha = a; for (let i = 0; i < n; i++) { g.beginPath(); g.arc(r() * 96, r() * 96, lo + r() * (hi - lo), 0, 7); g.fill(); } g.globalAlpha = 1; };
+  if (name === 'stone') { dot('#3a1a08', 0.14, 110, 0.6, 1.6); dot('#ffffff', 0.18, 90, 0.6, 1.6); }
+  else if (name === 'sand') { dot('#8a6a30', 0.2, 260, 0.4, 1); dot('#ffffff', 0.3, 160, 0.4, 1); g.strokeStyle = 'rgba(138,106,48,0.16)'; g.lineWidth = 1; for (let i = 0; i < 5; i++) { g.beginPath(); g.arc(r() * 96, 20 + i * 18, 30 + r() * 20, 3.4, 5.9); g.stroke(); } }
+  else if (name === 'pebble') { for (let i = 0; i < 26; i++) { const x = r() * 96, y = r() * 96, rx = 3 + r() * 6; g.fillStyle = 'rgba(255,255,255,0.2)'; g.strokeStyle = 'rgba(58,26,8,0.32)'; g.lineWidth = 1; g.beginPath(); g.ellipse(x, y, rx, rx * 0.7, r() * 3, 0, 7); g.fill(); g.stroke(); } }
+  else if (name === 'moss') { dot('#4f6e2c', 0.3, 34, 3, 9); dot('#7c9a4a', 0.3, 40, 2, 6); dot('#2f4a18', 0.25, 90, 0.5, 1.2); }
+  else { g.strokeStyle = 'rgba(80,30,10,0.26)'; g.lineWidth = 1; for (let i = 0; i < 9; i++) { let x = r() * 96, y = r() * 96; g.beginPath(); g.moveTo(x, y); for (let k = 0; k < 5; k++) { x += r() * 18 - 9; y += r() * 18 - 9; g.lineTo(x, y); } g.stroke(); } dot('#ffffff', 0.18, 60, 0.5, 1.4); }
+  return (texCache[name] = ctx.createPattern(T, 'repeat'));
+}
+function itemSize(it) { if (typeof it === 'string') it = { t: it }; if (it.img) return { w: 22, h: 22 }; ctx.font = '11px ' + FONT; return { w: ctx.measureText(it.t).width + (it.bg ? 8 : 0), h: it.bg ? 19 : 14 }; }
+const myItems = () => { const r = rooms.find(r => r.o === MY_ID); return r ? r.room.items : []; };
+function snapSpot(h, item) {                             // a dropped word clicks next to the nearest word of mine, so lines of words are easy to make
+  const mine = myItems(); let n = null, nd = 95;
+  for (const m of mine) { const d = Math.hypot(m.x - h.x, m.y - h.y); if (d < nd) { nd = d; n = m; } }
+  if (!n) return { x: Math.round(h.x), y: Math.round(h.y) };
+  const a = itemSize(n), b = itemSize(item), gap = 5;
+  const cands = [{ x: n.x + a.w / 2 + b.w / 2 + gap, y: n.y }, { x: n.x - a.w / 2 - b.w / 2 - gap, y: n.y }, { x: n.x, y: n.y + (a.h + b.h) / 2 + 2 }, { x: n.x, y: n.y - (a.h + b.h) / 2 - 2 }]
+    .filter(c => !mine.some(m => { const s = itemSize(m); return Math.abs(c.x - m.x) < (s.w + b.w) / 2 && Math.abs(c.y - m.y) < (s.h + b.h) / 2; }))
+    .sort((p, q) => Math.hypot(p.x - h.x, p.y - h.y) - Math.hypot(q.x - h.x, q.y - h.y));
+  const c = cands[0] || h; return { x: Math.round(Math.max(20, Math.min(NW - 20, c.x))), y: Math.round(Math.max(20, Math.min(NH - 20, c.y))) };
+}
+function drawRooms() {                                   // each room is a lighter cave with a floor of its own
   const g = roomLayer.getContext('2d');
   g.clearRect(0, 0, NW, NH);
   const R = cfg.roomR;
@@ -105,20 +136,27 @@ function drawRooms() {                                   // a lighter boundary a
     const items = r.room.items; if (!items.length) continue;
     let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
     for (const it of items) { x0 = Math.min(x0, it.x); y0 = Math.min(y0, it.y); x1 = Math.max(x1, it.x); y1 = Math.max(y1, it.y); }
-    x0 = Math.floor(x0 - R - 6); y0 = Math.floor(y0 - R - 6); const bw = Math.ceil(x1 - x0 + R + 6), bh = Math.ceil(y1 - y0 + R + 6);
-    const paint = (rad, col, comp) => { const t = layer(bw, bh), tx = t.getContext('2d'); tx.fillStyle = col; for (const it of items) { tx.beginPath(); tx.arc(it.x - x0, it.y - y0, rad, 0, 7); tx.fill(); } return t; };
-    const floor = paint(R, EARTH); g.drawImage(floor, x0, y0);                 // the room hides the tunnels under it
-    const ring = paint(R + 3, r.c), rx = ring.getContext('2d'); rx.globalCompositeOperation = 'destination-out';
+    x0 = Math.floor(x0 - R - 8); y0 = Math.floor(y0 - R - 8); const bw = Math.ceil(x1 - x0 + R + 8), bh = Math.ceil(y1 - y0 + R + 8);
+    const paint = (rad, col) => { const t = layer(bw, bh), tx = t.getContext('2d'); tx.fillStyle = col; for (const it of items) { tx.beginPath(); tx.arc(it.x - x0, it.y - y0, rad, 0, 7); tx.fill(); } return t; };
+    const ring = paint(R + 4, r.c), rx = ring.getContext('2d'); rx.globalCompositeOperation = 'destination-out';
     for (const it of items) { rx.beginPath(); rx.arc(it.x - x0, it.y - y0, R, 0, 7); rx.fill(); }
-    g.globalAlpha = 0.6; g.drawImage(ring, x0, y0);                           // the boundary
-    g.globalAlpha = 0.12; g.drawImage(paint(R, r.c), x0, y0); g.globalAlpha = 1; // the lighter floor
+    g.drawImage(ring, x0, y0);                                                // the lighter boundary
+    const floor = paint(R, mix(TEXBASE[r.tx || 'stone'], r.c, 0.18)), fx = floor.getContext('2d');
+    fx.globalCompositeOperation = 'source-atop'; fx.fillStyle = texPattern(r.tx); fx.fillRect(0, 0, bw, bh);
+    g.drawImage(floor, x0, y0);                                               // the floor hides the tunnels under it
   }
-  for (const r of rooms) for (const it of r.room.items) drawItem(g, it, it.x, it.y, 11, 1, 'nest');
+  for (const r of rooms) for (const it of r.room.items) drawItem(g, it, it.x, it.y, 11, 1, 'room');
   roomsDirty = false;
 }
 
 // ---------- the ant: Nouria's, with what I bought ----------
 const ant = { x: 700, y: 425, angle: -Math.PI / 2, step: 0, space: 'web', carry: [], ready: true };
+function effLook(lk, id) {                             // an ant that has bought nothing still gets a look of its own, from its id
+  if (lk && lk.c) return lk;
+  let h = 0; for (const c of (id || 'x')) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  const b = lk || {};
+  return { ...b, c: ['#c8553d', '#d9a441', '#d98e9a', '#a8643a', '#2a9d8f'][h % 5], sz: b.sz && b.sz !== 1 ? b.sz : [0.9, 1, 1.15, 1.3, 0.85][(h >> 3) % 5], pt: b.pt || [null, 'stripes', 'dots', null][(h >> 5) % 4] };
+}
 const head = a => ({ x: a.x + Math.cos(a.angle) * 8, y: a.y + Math.sin(a.angle) * 8 });
 const maxCarry = () => look.t === 'carrier' ? 2 : 1;
 const nestLike = () => ant.space === 'nest';
@@ -165,6 +203,7 @@ function updateAnt() {
     camX += (Math.max(0, Math.min(NW - vw, ant.x - vw / 2)) - camX) * 0.12;
     camY += (Math.max(0, Math.min(NH - vh, ant.y - vh / 2)) - camY) * 0.12;
   }
+  if (coarse && mouseDown && pageLike() && !crop) { const ph = ant.space === 'B' ? (bpage ? bpage.pageHeight : LH) : pageHeight, my = (cy - voy) / sc; if (my > LH - 90) scrollY = Math.min(Math.max(0, ph - LH), scrollY + 7); else if (my < 90) scrollY = Math.max(0, scrollY - 7); }
   portals();
   if (crop && mouseDown && ant.space === 'B') { const h = head(ant), p = { x: h.x, y: h.y + scrollY }; const im = bpage.images[crop.i]; if (p.x > im.x && p.x < im.x + im.w && p.y > im.y && p.y < im.y + im.h) { crop.pts.push(p); if (crop.pts.length > 600) crop.pts.shift(); } }
 }
@@ -200,11 +239,12 @@ function drawAnt(x, y, angle, step, carry, space, alpha, lk) {
   const col = lk.c || '#111111', a = alpha / 255;
   ctx.save(); ctx.translate(x, y); ctx.rotate(angle); ctx.scale(lk.sz || 1, lk.sz || 1);
   if (lk.gl) { const g = ctx.createRadialGradient(0, 0, 2, 0, 0, 26); g.addColorStop(0, hexA(lk.c || '#f6dfd2', 0.55 * a)); g.addColorStop(1, hexA(lk.c || '#f6dfd2', 0)); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, 26, 0, 7); ctx.fill(); }
+  if (lk.halo) { const g = ctx.createRadialGradient(0, 0, 3, 0, 0, 20); g.addColorStop(0, 'rgba(255,240,225,0.6)'); g.addColorStop(1, 'rgba(255,240,225,0)'); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, 20, 0, 7); ctx.fill(); }
   const items = Array.isArray(carry) ? carry : (carry ? [carry] : []);
   items.forEach((it, i) => {                             // the word in its mandibles
     ctx.save(); ctx.translate(10 + i * 0, i * 11 - (items.length - 1) * 5.5);
     if (typeof it === 'object' && (it.img || it.bg)) { ctx.rotate(0); drawItem(ctx, it, 14, 0, 10, a, space); }
-    else { ctx.globalAlpha = a; ctx.fillStyle = (space === 'web' || space === 'B') ? RED : LIGHT; ctx.font = '10px ' + FONT; ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.fillText(typeof it === 'object' ? it.t : it, 0, 0); }
+    else { ctx.globalAlpha = a; ctx.fillStyle = (space === 'web' || space === 'B' || space === 'C') ? RED : LIGHT; ctx.font = '10px ' + FONT; ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.fillText(typeof it === 'object' ? it.t : it, 0, 0); }
     ctx.restore();
   });
   ctx.strokeStyle = hexA(col, a); ctx.lineWidth = 1;     // three strokes for the legs
@@ -248,7 +288,7 @@ function updateOthers() {                                // between two messages
 function drawOthers(space) {                             // I only see the ants that are in the same space as me
   for (const id in others) {
     const o = others[id];
-    if (o.s === space && (space !== 'B' || (bpage && o.p === bpage.key))) drawAnt(o.x, o.y, o.angle, o.step, o.carry, o.s, o.g ? 55 : 130, o.look);
+    if (o.s === space && (space !== 'B' || (bpage && o.p === bpage.key))) drawAnt(o.x, o.y, o.angle, o.step, o.carry, o.s, o.g ? 55 : 130, effLook(o.look, id));
   }
 }
 
@@ -294,7 +334,7 @@ function drawFx(space, offY) {
     if (f.s !== space || (space === 'B' && f.p !== (bpage ? bpage.key : ''))) continue;
     const k = (now - f.t) / (f.k === 'pulse' ? 1400 : 600), y = f.y - offY;
     ctx.save(); ctx.globalAlpha = Math.max(0, 1 - k);
-    ctx.strokeStyle = space === 'web' || space === 'B' ? RED : LIGHT; ctx.lineWidth = 1.5;
+    ctx.strokeStyle = space === 'web' || space === 'B' || space === 'C' ? RED : LIGHT; ctx.lineWidth = 1.5;
     if (f.k === 'touch') { ctx.beginPath(); ctx.moveTo(f.x - 6, y - 6 - k * 6); ctx.lineTo(f.x - 2, y - 2); ctx.moveTo(f.x + 6, y - 6 - k * 6); ctx.lineTo(f.x + 2, y - 2); ctx.stroke(); }
     else { ctx.beginPath(); ctx.arc(f.x, y, 8 + k * (f.k === 'pulse' ? 90 : 26), 0, 7); ctx.stroke(); }
     ctx.restore();
@@ -398,8 +438,8 @@ function drawNest() {
   drawArrows();
 }
 function drawArrows() {                                  // small arrows at the edge point to doors and to my rooms that are out of view
-  const targets = Object.entries(PORTALS).map(([k, p]) => ({ x: p.x, y: p.y, c: p.c, fill: true }));
-  const mine = rooms.filter(r => r.o === MY_ID && r.room.items.length).map(r => ({ x: r.room.cx, y: r.room.cy, c: r.c, fill: false }));
+  const targets = Object.entries(PORTALS).map(([k, p]) => ({ x: p.x, y: p.y, c: p.c, fill: true, n: { A: 'intro', B: 'portal', C: 'store' }[k] }));
+  const mine = rooms.filter(r => r.o === MY_ID && r.room.items.length).map(r => ({ x: r.room.cx, y: r.room.cy, c: r.c, fill: false, n: 'room' }));
   mine.sort((a, b) => Math.hypot(a.x - ant.x, a.y - ant.y) - Math.hypot(b.x - ant.x, b.y - ant.y));
   targets.push(...mine.slice(0, 2));
   ctx.save(); ctx.scale(sc, sc);
@@ -413,6 +453,8 @@ function drawArrows() {                                  // small arrows at the 
     ctx.beginPath(); ctx.moveTo(12, 0); ctx.lineTo(-7, -8); ctx.lineTo(-3, 0); ctx.lineTo(-7, 8); ctx.closePath();
     if (t.fill) { ctx.fillStyle = hexA(t.c, 0.9); ctx.fill(); } else { ctx.strokeStyle = t.c; ctx.lineWidth = 2; ctx.stroke(); }
     ctx.restore();
+    ctx.font = '11px ' + FONT; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = hexA(t.c, 0.95);
+    ctx.fillText(t.n, Math.max(30, Math.min(vw - 30, ax)), ay + (ay > vh / 2 ? -19 : 19));
   }
   ctx.restore();
 }
@@ -421,15 +463,16 @@ function drawArrows() {                                  // small arrows at the 
 const SHOP = [];
 (function () {
   const add = (id, label, price, x, y, kind, val) => SHOP.push({ id, label, price, x, y, kind, val });
-  add('type:ant', 'ant', 0, 330, 230, 'type', null); add('type:scout', 'scout', 30, 560, 230, 'type', 'scout');
-  add('type:carrier', 'carrier', 30, 790, 230, 'type', 'carrier'); add('type:digger', 'digger', 30, 1020, 230, 'type', 'digger');
-  const cols = [['black', null, 0], ...PALETTE.map((c, i) => ['p' + i, c, 5]), ['teal', '#2a9d8f', 8], ['violet', '#9b5de5', 8], ['blue', '#00bbf9', 8], ['lime', '#9ef01a', 8], ['pink', '#f15bb5', 8]];
-  cols.forEach((c, i) => add('col:' + c[0], c[2] ? c[2] + '' : 'free', c[2], 190 + i * 92, 440, 'col', c[1]));
-  add('size:0.8', 'small', 5, 330, 640, 'size', 0.8); add('size:1', 'normal', 0, 480, 640, 'size', 1); add('size:1.45', 'large', 5, 630, 640, 'size', 1.45);
-  add('glow', 'glow', 10, 820, 640, 'gl', 1); add('stroke', 'stroke', 10, 970, 640, 'st', 1);
-  add('pat:stripes', 'stripes', 10, 1120, 640, 'pt', 'stripes'); add('pat:dots', 'dots', 10, 1260, 640, 'pt', 'dots');
+  add('type:ant', 'ant', 0, 330, 170, 'type', null); add('type:scout', 'scout', 30, 560, 170, 'type', 'scout');
+  add('type:carrier', 'carrier', 30, 790, 170, 'type', 'carrier'); add('type:digger', 'digger', 30, 1020, 170, 'type', 'digger');
+  const cols = [['black', '#111111', 0], ...PALETTE.map((c, i) => ['p' + i, c, 5]), ['teal', '#2a9d8f', 8], ['violet', '#9b5de5', 8], ['blue', '#00bbf9', 8], ['lime', '#9ef01a', 8], ['pink', '#f15bb5', 8]];
+  cols.forEach((c, i) => add('col:' + c[0], c[2] ? c[2] + '' : 'free', c[2], 190 + i * 92, 330, 'col', c[1]));
+  add('size:0.8', 'small', 5, 250, 490, 'size', 0.8); add('size:1', 'normal', 0, 400, 490, 'size', 1); add('size:1.45', 'large', 5, 550, 490, 'size', 1.45);
+  add('glow', 'glow', 10, 760, 490, 'gl', 1); add('stroke', 'stroke', 10, 910, 490, 'st', 1);
+  add('pat:stripes', 'stripes', 10, 1060, 490, 'pt', 'stripes'); add('pat:dots', 'dots', 10, 1200, 490, 'pt', 'dots');
+  [['stone', 0, null], ['sand', 10, 'sand'], ['pebble', 10, 'pebble'], ['moss', 10, 'moss'], ['clay', 10, 'clay']].forEach((t, i) => add('tx:' + t[0], t[0] + ' floor', t[1], 250 + i * 230, 650, 'tx', t[2]));
 })();
-const equipped = it => it.kind === 'type' ? look.t === it.val : it.kind === 'col' ? look.c === it.val : it.kind === 'size' ? look.sz === it.val : it.kind === 'gl' ? !!look.gl : it.kind === 'st' ? !!look.st : look.pt === it.val;
+const equipped = it => it.kind === 'type' ? look.t === it.val : it.kind === 'col' ? look.c === it.val : it.kind === 'size' ? look.sz === it.val : it.kind === 'gl' ? !!look.gl : it.kind === 'st' ? !!look.st : it.kind === 'tx' ? (look.tx || null) === it.val : look.pt === it.val;
 function shopItemUnderAnt() { const h = head(ant); return SHOP.find(it => Math.hypot(it.x - h.x, it.y - h.y) < 34); }
 function buy(it) {
   if (!owned.includes(it.id)) {
@@ -437,37 +480,40 @@ function buy(it) {
     tokens -= it.price; owned.push(it.id); beep(660, 0.12, 0.06, 'triangle', 990);
   }
   if (it.kind === 'type') look.t = it.val; else if (it.kind === 'col') look.c = it.val; else if (it.kind === 'size') look.sz = it.val;
-  else if (it.kind === 'gl') look.gl = look.gl ? 0 : 1; else if (it.kind === 'st') look.st = look.st ? 0 : 1; else if (it.kind === 'pt') look.pt = look.pt === it.val ? null : it.val;
+  else if (it.kind === 'gl') look.gl = look.gl ? 0 : 1; else if (it.kind === 'st') look.st = look.st ? 0 : 1; else if (it.kind === 'pt') look.pt = look.pt === it.val ? null : it.val; else if (it.kind === 'tx') look.tx = it.val;
   saveMe();
 }
 function drawMarket() {
-  ctx.fillStyle = '#2a1608'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#e4cba6'; ctx.fillRect(0, 0, W, H);
   ctx.save(); ctx.translate(vox, voy); ctx.scale(sc, sc);
-  ctx.strokeStyle = 'rgba(224,160,64,0.25)'; ctx.lineWidth = 1;
-  for (const y of [330, 540, 760]) { ctx.beginPath(); ctx.moveTo(120, y); ctx.lineTo(1280, y); ctx.stroke(); }   // the three stalls
+  ctx.strokeStyle = 'rgba(122,46,18,0.28)'; ctx.lineWidth = 1;
+  for (const y of [250, 410, 570, 730]) { ctx.beginPath(); ctx.moveTo(120, y); ctx.lineTo(1280, y); ctx.stroke(); }   // the four stalls
+  ctx.fillStyle = 'rgba(122,46,18,0.55)'; ctx.font = '11px ' + FONT; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  [['types', 120, 150], ['colours', 120, 310], ['sizes and marks', 120, 470], ['cave floors', 120, 630]].forEach(a => ctx.fillText(a[0], a[1], a[2]));
   const under = shopItemUnderAnt();
   for (const it of SHOP) {
     const own = owned.includes(it.id), on = equipped(it);
-    if (it.kind === 'col') { ctx.fillStyle = it.val || '#111'; ctx.beginPath(); ctx.arc(it.x, it.y, 16, 0, 7); ctx.fill(); ctx.strokeStyle = LIGHT; ctx.lineWidth = 0.8; ctx.stroke(); }
+    if (it.kind === 'col') { ctx.fillStyle = it.val || '#111'; ctx.beginPath(); ctx.arc(it.x, it.y, 16, 0, 7); ctx.fill(); ctx.strokeStyle = RED; ctx.lineWidth = 0.8; ctx.stroke(); }
+    else if (it.kind === 'tx') { const k = it.val || 'stone'; ctx.beginPath(); ctx.arc(it.x, it.y, 24, 0, 7); ctx.fillStyle = TEXBASE[k]; ctx.fill(); ctx.fillStyle = texPattern(k); ctx.fill(); ctx.strokeStyle = RED; ctx.lineWidth = 1; ctx.stroke(); }
     else {
-      const lk = it.kind === 'type' ? { t: it.val, c: look.c, sz: 2.2 } : it.kind === 'size' ? { sz: it.val * 2.2, c: look.c } : it.kind === 'gl' ? { gl: 1, sz: 2.2, c: look.c } : it.kind === 'st' ? { st: 1, sz: 2.2, c: look.c } : { pt: it.val, sz: 2.2, c: look.c || '#555555' };
-      if (!lk.c) lk.c = '#c99a86';
-      drawAnt(it.x, it.y, -Math.PI / 2, 0, null, 'C', 255, { ...lk, c: lk.c === '#111111' ? '#c99a86' : lk.c });
+      const c = look.c || '#7a2e12';
+      const lk = it.kind === 'type' ? { t: it.val, c, sz: 2.2 } : it.kind === 'size' ? { sz: it.val * 2.2, c } : it.kind === 'gl' ? { gl: 1, sz: 2.2, c } : it.kind === 'st' ? { st: 1, sz: 2.2, c } : { pt: it.val, sz: 2.2, c };
+      drawAnt(it.x, it.y, -Math.PI / 2, 0, null, 'C', 255, lk);
     }
-    if (on) { ctx.strokeStyle = '#e0a040'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(it.x, it.y, 26, 0, 7); ctx.stroke(); }
-    if (under === it) { ctx.strokeStyle = LIGHT; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(it.x, it.y, 32, 0, 7); ctx.stroke(); }
-    ctx.fillStyle = own ? 'rgba(246,223,210,0.55)' : LIGHT; ctx.font = '11px ' + FONT; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
-    ctx.fillText(it.kind === 'col' ? (own ? '' : it.label) : it.label + (it.price && !own ? ' · ' + it.price : ''), it.x, it.y + 44);
+    if (on) { ctx.strokeStyle = '#b9731a'; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(it.x, it.y, 30, 0, 7); ctx.stroke(); }
+    if (under === it) { ctx.strokeStyle = RED; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(it.x, it.y, 36, 0, 7); ctx.stroke(); }
+    ctx.fillStyle = own ? 'rgba(58,26,8,0.5)' : '#3a1a08'; ctx.font = '11px ' + FONT; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText(it.kind === 'col' ? (own ? '' : it.label) : it.label + (it.price && !own ? ' · ' + it.price : ''), it.x, it.y + 48);
   }
   drawOthers('C'); drawFx('C', 0);
-  ctx.fillStyle = '#e0a040'; ctx.beginPath(); ctx.arc(HOLE.x, HOLE.y, HOLE.r, 0, 7); ctx.fill();
+  ctx.fillStyle = '#b9731a'; ctx.beginPath(); ctx.arc(HOLE.x, HOLE.y, HOLE.r, 0, 7); ctx.fill();
   ctx.restore();
 }
 
 // ---------- the screen furniture ----------
 function drawHud() {
   const here = Object.values(others).filter(o => !o.g && sameSpace(o)).length + 1;
-  const dark = nestLike() || ant.space === 'C';
+  const dark = nestLike();
   ctx.font = '11px ' + FONT; ctx.textBaseline = 'top';
   ctx.fillStyle = !dark ? 'rgb(150,150,150)' : '#c99a86'; ctx.textAlign = 'right';
   ctx.fillText(here + (here > 1 ? ' ants here' : ' ant here'), W - 12, 10);
@@ -477,7 +523,7 @@ function drawHud() {
   const names = { web: 'page', nest: 'nest', B: 'open web', C: 'market' };
   const parts = Object.keys(away).filter(k => away[k]).map(k => names[k] + ' ' + away[k]);
   if (parts.length) { ctx.textBaseline = 'bottom'; ctx.fillText('elsewhere: ' + parts.join(' · '), 12, H - 10); }
-  if (performance.now() < 25000) { ctx.textAlign = 'center'; ctx.globalAlpha = Math.min(1, (25000 - performance.now()) / 4000); ctx.textBaseline = 'bottom'; ctx.fillText('click: take · drop · eat · buy      shift: boost      S: scent      Q: call      F: follow      G: give      M: sound', W / 2, H - 10); ctx.globalAlpha = 1; }
+  if (performance.now() < 25000) { ctx.textAlign = 'center'; ctx.globalAlpha = Math.min(1, (25000 - performance.now()) / 4000); ctx.textBaseline = 'bottom'; ctx.fillText('click: take · pick up · place · buy      E: eat your word      shift: boost      S: scent      Q: call      F: follow      G: give      M: sound', W / 2, H - 10); ctx.globalAlpha = 1; }
 }
 
 // ---------- the loop: 60 steps per second, whatever the screen ----------
@@ -493,7 +539,7 @@ function frame(tm) {
   if (sp === 'web') drawWeb(); else if (sp === 'nest') drawNest(); else if (sp === 'B') drawOpenWeb(); else drawMarket();
   ctx.save(); ctx.translate(vox, voy); ctx.scale(sc, sc);
   if (nestLike()) ctx.translate(-camX, -camY);
-  drawAnt(ant.x, ant.y, ant.angle, ant.step, ant.carry, sp, 255, look);
+  drawAnt(ant.x, ant.y, ant.angle, ant.step, ant.carry, sp, 255, { ...effLook(look, MY_ID), halo: sp === 'nest' || sp === 'C' });
   ctx.restore();
   drawHud();
 }
@@ -503,9 +549,10 @@ function resize() {
   DPR = window.devicePixelRatio || 1; W = innerWidth; H = innerHeight;
   cv.width = W * DPR; cv.height = H * DPR; cv.style.width = W + 'px'; cv.style.height = H + 'px';
   sc = Math.min(W / LW, H / LH);
+  if (window.__still) requestAnimationFrame(frame);        // a still picture is drawn again after the window changes size
 }
 addEventListener('resize', resize);
-addEventListener('pointermove', e => { cx = e.clientX; cy = e.clientY; });
+addEventListener('pointermove', e => { if (e.target.closest && e.target.closest('#pad')) return; cx = e.clientX; cy = e.clientY; });
 addEventListener('wheel', e => {
   if (!cfg || !pageLike()) return;
   e.preventDefault();
@@ -518,7 +565,7 @@ function post(m) {
 }
 function earn() { tokens++; saveMe(); beep(500, 0.07, 0.04, 'triangle'); }
 addEventListener('pointerdown', e => {
-  if (e.target.closest && e.target.closest('#bar')) return;
+  if (e.target.closest && e.target.closest('#bar,#pad')) return;
   cx = e.clientX; cy = e.clientY; mouseDown = true;
   if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (_) {} }
   if (!cfg) return;
@@ -539,21 +586,21 @@ addEventListener('pointerdown', e => {
     }
   } else if (ant.space === 'nest') {
     const h = head(ant);
-    if (ant.carry.length) { const item = ant.carry.pop(); post({ kind: 'drop', item, x: Math.round(h.x), y: Math.round(h.y) }); }   // drop
-    else post({ kind: 'eat', x: Math.round(h.x), y: Math.round(h.y) }).then(r => { if (r.ok) beep(300, 0.12, 0.05, 'sawtooth', 120); });   // eat what I stored
+    if (ant.carry.length) { const item = ant.carry.pop(), p = snapSpot(h, item); post({ kind: 'drop', item, x: p.x, y: p.y }); beep(420, 0.06, 0.04); }   // place, next to my other words
+    else if (myItems().some(m => Math.hypot(m.x - h.x, m.y - h.y) < 34))                                                                         // pick up one of my words to move it
+      post({ kind: 'pick', x: Math.round(h.x), y: Math.round(h.y) }).then(r => { if (r.ok && r.item && ant.carry.length < maxCarry()) { ant.carry.push(r.item); beep(520, 0.08, 0.04, 'triangle', 700); } });
   } else if (ant.space === 'C') {
     const it = shopItemUnderAnt(); if (it) buy(it);
   }
 });
 addEventListener('pointerup', () => { mouseDown = false; if (crop) doCrop(); });
-addEventListener('keydown', e => {
-  if (document.activeElement === qEl) return;
-  const k = e.key.toLowerCase();
+function keyDown(k, repeat) {
   if (k === 'shift') keys.shift = true;
-  if (e.repeat) return;
+  if (repeat) return;
   if (k === 'f') keys.f = true;
   if (!cfg) return;
   if (k === 'm') { muted = !muted; store.set('antMuted', muted); }
+  if (k === 'e' && ant.space === 'nest') { const h = head(ant); post({ kind: 'eat', x: Math.round(h.x), y: Math.round(h.y) }).then(r => { if (r.ok) beep(300, 0.12, 0.05, 'sawtooth', 120); }); }
   if (k === 's' && (ant.space === 'web' || ant.space === 'nest')) { const y = ant.space === 'web' ? ant.y + scrollY : ant.y; post({ kind: 'mark', x: Math.round(ant.x), y: Math.round(y), s: ant.space }); beep(700, 0.08, 0.03); }
   if (k === 'q') { post({ kind: 'pulse', s: ant.space }); fxs.push({ k: 'pulse', s: ant.space, p: bpage ? bpage.key : '', x: ant.x, y: pageLike() ? ant.y + scrollY : ant.y, t: performance.now() }); beep(260, 0.5, 0.05, 'sine', 420); }
   if (k === 'g' && ant.carry.length) {                                          // pass the word on to the nearest visitor
@@ -561,8 +608,20 @@ addEventListener('keydown', e => {
     const id = o && Object.keys(others).find(i => others[i] === o);
     if (id) { const item = ant.carry[ant.carry.length - 1]; post({ kind: 'give', to: id, item }).then(r => { if (r.ok) { ant.carry.pop(); beep(600, 0.1, 0.05, 'triangle', 900); } }); }
   }
-});
+}
+addEventListener('keydown', e => { if (document.activeElement === qEl) return; keyDown(e.key.toLowerCase(), e.repeat); });
 addEventListener('keyup', e => { const k = e.key.toLowerCase(); if (k === 'shift') keys.shift = false; if (k === 'f') keys.f = false; });
+// touch screens: the keys become buttons, and the page scrolls when the finger is near its top or bottom edge
+const coarse = matchMedia('(pointer: coarse)').matches || 'ontouchstart' in window;
+if (coarse) {
+  const pad = document.getElementById('pad'); pad.style.display = 'flex';
+  pad.querySelectorAll('button').forEach(b => {
+    const k = b.dataset.k, hold = !!b.dataset.hold;
+    b.addEventListener('pointerdown', e => { e.preventDefault(); if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (_) {} } b.classList.add('on'); keyDown(k, false); });
+    const up = () => { b.classList.remove('on'); if (hold) { if (k === 'shift') keys.shift = false; if (k === 'f') keys.f = false; } };
+    b.addEventListener('pointerup', up); b.addEventListener('pointercancel', up); b.addEventListener('pointerleave', up);
+  });
+}
 addEventListener('blur', () => { keys = {}; mouseDown = false; });
 
 // I tell the others where my ant is (on a page: position in the page, not on screen)
