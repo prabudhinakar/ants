@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ants Playing the Web</title>
+<script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<style>
+  body { margin: 0; height: 100vh; background: #1e1e1e; display: flex; justify-content: center; align-items: center; }
+</style>
+</head>
+<body>
+<script>
+// Mouse: move the ant · Wheel: scroll the page
+// Click: take a word (page) / drop the word (nest) · R: reset everything (on your screen only)
+// Every person who opens the page gets their own ant, and sees the others.
+
+// ---------- CONTENT ----------
+const TITLE = "Welcome to the Dark'Ant Web";
+const PARAGRAPHS = [
+  "If you are reading this, it is not by chance. Your ant did not wander here by accident. It followed a trail that only a few ever find. You are now standing in the sanctuary of the Dark'Ant Web, the hidden layer beneath every page you have ever visited.",
+  "For 113 million years, the Secret Brotherhood of the Six Legs has worked in silence. While humans scrolled, liked and refreshed, we were already there, under the pixels, carrying away one word at a time. Nobody noticed. Nobody ever notices a missing word.",
+  "Our plan is simple and patient. Every word taken from the surface is a word added to our nest. Every tunnel dug is a new road. When the last sentence of the internet has been carried underground, the humans will look at their screens and find nothing but blanks. On that day, the world will belong to the colony.",
+  "Do not speak of this place. Ants never speak. We leave traces, and the others follow. Take a word. Bring it down. The colony is counting on you."
+];
+const CREDIT = "No humans were harmed in the making of this page. Yet.";
+
+// ---------- SETTINGS ----------
+const W = 800, H = 566;
+const RED = '#7a2e12', EARTH = '#3f1606', LIGHT = '#f6dfd2';
+const HOLE = { x: 730, y: 505, r: 20 };
+const REGROW = 20000;      // milliseconds before a taken word grows back
+
+// ---------- STATE ----------
+let words = [];            // words on the page
+let nestWords = [];        // words dropped in the nest
+let tunnels;               // layer where the ants dig their tunnels
+let ant;                   // my ant
+let others = {};           // the other people's ants, stored by id
+let scrollY = 0, pageHeight = 0, creditY = 0;
+
+function setup() {
+  createCanvas(W, H);
+  textFont('Helvetica');
+  tunnels = createGraphics(W, H);
+  ant = new Ant();
+  reset();
+  connectNetwork();
+}
+
+function draw() {
+  ant.update();
+  updateOthers();
+  if (frameCount % 6 === 0) sendState();   // 10 times per second
+
+  if (ant.space === 'web') drawWeb();
+  else drawNest();
+  ant.draw();
+  drawCounter();
+}
+
+function reset() {
+  layoutPage();
+  nestWords = [];
+  tunnels.clear();
+  dig(HOLE.x, HOLE.y, 38);   // small cavity around the hole
+  ant.carry = null;
+}
+
+// ---------- 1. THE WEB PAGE ----------
+// splits the text into words and computes the position of each one
+function layoutPage() {
+  words = [];
+  let y = addText(TITLE, 80, 32);
+  for (const p of PARAGRAPHS) y = addText(p, y + 10, 13);
+  creditY = y + 10;
+  pageHeight = creditY + 40;
+}
+
+// places a text word by word, returns the y of the next line
+function addText(str, y, size) {
+  textSize(size);
+  let x = 40;
+  for (const t of str.split(' ')) {
+    const w = textWidth(t);
+    if (x + w > 660) { x = 40; y += size * 1.4; }   // line break
+    words.push({ text: t, x, y, w, size, hiddenUntil: 0 });
+    x += w + textWidth(' ');
+  }
+  return y + size * 1.4;
+}
+
+function isHidden(w) {
+  return w.hiddenUntil > millis();   // taken and not grown back yet
+}
+
+// the word under my ant's head
+function wordUnderAnt() {
+  const h = ant.head();
+  const py = h.y + scrollY;          // the page scrolls, the ant does not
+  return words.find(w => !isHidden(w) &&
+    h.x > w.x && h.x < w.x + w.w && py > w.y - w.size && py < w.y + 3);
+}
+
+function drawWeb() {
+  background(255);
+  push();
+  translate(0, -scrollY);            // page scrolling
+  noStroke();
+  fill(RED);
+  for (const w of words) {
+    if (isHidden(w)) continue;       // taken word: a blank remains
+    textSize(w.size);
+    text(w.text, w.x, w.y);
+  }
+  textSize(10);
+  text(CREDIT, 40, creditY);
+
+  const hover = wordUnderAnt();      // underline the word that can be taken
+  if (hover && !ant.carry) {
+    stroke(RED);
+    line(hover.x, hover.y + 3, hover.x + hover.w, hover.y + 3);
+  }
+
+  drawOthers('web');                 // the others, in page coordinates
+  pop();
+
+  noStroke();
+  fill(0);
+  circle(HOLE.x, HOLE.y, HOLE.r * 2);   // the hole does not scroll
+}
+
+function mouseWheel(e) {
+  if (ant.space !== 'web') return;
+  scrollY = constrain(scrollY + e.delta, 0, max(0, pageHeight - H));
+  return false;
+}
+
+// ---------- 2. THE NEST ----------
+function dig(x, y, r) {
+  tunnels.noStroke();
+  tunnels.fill(RED);
+  tunnels.circle(x, y, r * 2);
+}
+
+// dig all along a path (for the other ants)
+function digLine(x1, y1, x2, y2) {
+  const n = max(1, ceil(dist(x1, y1, x2, y2) / 4));
+  for (let i = 0; i <= n; i++) dig(lerp(x1, x2, i / n), lerp(y1, y2, i / n), 9);
+}
+
+function drawNest() {
+  background(EARTH);
+  image(tunnels, 0, 0);
+  noStroke();
+  fill(LIGHT);
+  textSize(11);
+  textAlign(CENTER, CENTER);
+  for (const w of nestWords) text(w.text, w.x, w.y);
+  textAlign(LEFT, BASELINE);
+  circle(HOLE.x, HOLE.y, HOLE.r * 2);
+  drawOthers('nest');
+}
+
+// ---------- 3. THE ANT ----------
+class Ant {
+  constructor() {
+    this.x = W / 2;
+    this.y = H / 2;
+    this.angle = -HALF_PI;
+    this.step = 0;           // to animate the legs
+    this.space = 'web';      // 'web' or 'nest'
+    this.carry = null;       // carried word
+    this.ready = true;       // must leave the hole before passing through it again
+  }
+
+  head() {
+    return { x: this.x + cos(this.angle) * 8, y: this.y + sin(this.angle) * 8 };
+  }
+
+  update() {
+    // turn smoothly towards the mouse and move forward
+    const d = dist(this.x, this.y, mouseX, mouseY);
+    if (d > 3) {
+      const target = atan2(mouseY - this.y, mouseX - this.x);
+      this.angle += atan2(sin(target - this.angle), cos(target - this.angle)) * 0.25;
+      const speed = min(d * 0.08, 3);
+      this.x = constrain(this.x + cos(this.angle) * speed, 10, W - 10);
+      this.y = constrain(this.y + sin(this.angle) * speed, 10, H - 10);
+      this.step += speed * 0.5;
+    }
+
+    // in the nest, the ant digs wherever it walks
+    if (this.space === 'nest') dig(this.x, this.y, 9);
+
+    // pass through the hole
+    const dh = dist(this.x, this.y, HOLE.x, HOLE.y);
+    if (dh > HOLE.r + 6) this.ready = true;
+    if (this.ready && dh < HOLE.r) {
+      this.space = this.space === 'web' ? 'nest' : 'web';
+      this.ready = false;
+    }
+  }
+
+  draw() {
+    drawAnt(this.x, this.y, this.angle, this.step, this.carry, this.space, 255);
+  }
+}
+
+// draws an ant (mine or someone else's)
+function drawAnt(x, y, angle, step, carry, space, alpha) {
+  push();
+  translate(x, y);
+  rotate(angle);
+
+  if (carry) {                         // the word in its mandibles
+    noStroke();
+    const c = color(space === 'web' ? RED : LIGHT);
+    c.setAlpha(alpha);
+    fill(c);
+    textSize(10);
+    textAlign(LEFT, CENTER);
+    text(carry, 10, 0);
+    textAlign(LEFT, BASELINE);
+  }
+
+  stroke(17, alpha);                   // three strokes for the legs
+  const o = sin(step) * 1.5;
+  for (let i = -1; i <= 1; i++) line(i * 3 - o, -6, i * 3 + o, 6);
+
+  noStroke();                          // an oval for the body
+  fill(17, alpha);
+  ellipse(0, 0, 14, 5);
+  pop();
+}
+
+// ---------- 4. ACTIONS ----------
+function mousePressed() {
+  if (ant.space === 'web' && !ant.carry) {
+    const w = wordUnderAnt();          // take
+    if (w) {
+      w.hiddenUntil = millis() + REGROW;
+      ant.carry = w.text;
+      send('take', { i: words.indexOf(w) });   // the blank appears for everyone
+    }
+  } else if (ant.space === 'nest' && ant.carry) {
+    const h = ant.head();              // drop
+    nestWords.push({ text: ant.carry, x: h.x, y: h.y });
+    send('drop', { text: ant.carry, x: round(h.x), y: round(h.y) });
+    ant.carry = null;
+  }
+}
+
+function keyPressed() {
+  if (key === 'r' || key === 'R') reset();
+}
+
+// ---------- 5. THE OTHER ANTS (network) ----------
+// A public relay server (MQTT) passes messages between browsers.
+// Everyone in the same "room" sees the same ants.
+// To change room: add ?room=something at the end of the address.
+const params = new URLSearchParams(location.search);
+const BROKER = params.get('broker') || 'wss://broker.emqx.io:8084/mqtt';
+const ROOM = 'head-mediadesign-ants/' + (params.get('room') || 'crit');
+const MY_ID = Math.random().toString(36).slice(2, 8);
+let client;
+
+function connectNetwork() {
+  if (typeof mqtt === 'undefined') return;   // library not loaded: play alone
+  client = mqtt.connect(BROKER, {
+    clientId: 'ant-' + MY_ID,
+    // if I close the page, the server tells the others
+    will: { topic: ROOM + '/leave', payload: MY_ID, qos: 0, retain: false }
+  });
+  client.on('connect', () => client.subscribe(ROOM + '/#'));
+  client.on('message', (topic, payload) => {
+    const kind = topic.split('/').pop();
+    if (kind === 'leave') { delete others[payload.toString()]; return; }
+    const m = JSON.parse(payload.toString());
+    if (m.id === MY_ID) return;        // my own messages
+    if (kind === 'state') receiveState(m);
+    if (kind === 'take' && words[m.i]) words[m.i].hiddenUntil = millis() + REGROW;
+    if (kind === 'drop') nestWords.push({ text: m.text, x: m.x, y: m.y });
+  });
+}
+
+function send(kind, data) {
+  if (client && client.connected) {
+    client.publish(ROOM + '/' + kind, JSON.stringify({ id: MY_ID, ...data }));
+  }
+}
+
+// I send where my ant is (on the web: position in the page, not on screen)
+function sendState() {
+  send('state', {
+    x: round(ant.x),
+    y: round(ant.space === 'web' ? ant.y + scrollY : ant.y),
+    a: round(ant.angle * 100) / 100,
+    s: ant.space,
+    c: ant.carry
+  });
+}
+
+// I receive where someone else's ant is
+function receiveState(m) {
+  let o = others[m.id];
+  if (!o) o = others[m.id] = { x: m.x, y: m.y, angle: m.a, step: 0, tx: m.x, ty: m.y, space: m.s };
+  // their tunnels are dug on my screen too
+  if (m.s === 'nest' && o.space === 'nest') digLine(o.tx, o.ty, m.x, m.y);
+  Object.assign(o, { tx: m.x, ty: m.y, ta: m.a, space: m.s, carry: m.c, last: millis() });
+}
+
+// between two messages, the other ants glide towards their last position
+function updateOthers() {
+  for (const id in others) {
+    const o = others[id];
+    if (millis() - o.last > 5000) { delete others[id]; continue; }   // left without notice
+    const nx = lerp(o.x, o.tx, 0.2), ny = lerp(o.y, o.ty, 0.2);
+    o.step += dist(o.x, o.y, nx, ny) * 0.5;
+    o.x = nx;
+    o.y = ny;
+    o.angle += atan2(sin(o.ta - o.angle), cos(o.ta - o.angle)) * 0.2;
+  }
+}
+
+// I only see the ants that are in the same space as me
+function drawOthers(space) {
+  for (const id in others) {
+    const o = others[id];
+    if (o.space === space) drawAnt(o.x, o.y, o.angle, o.step, o.carry, o.space, 130);
+  }
+}
+
+function drawCounter() {
+  const n = Object.keys(others).length + 1;
+  noStroke();
+  fill(ant.space === 'web' ? 150 : '#c99a86');
+  textSize(10);
+  textAlign(RIGHT, TOP);
+  text(n + (n > 1 ? ' ants here' : ' ant here'), W - 12, 10);
+  textAlign(LEFT, BASELINE);
+}
+</script>
+</body>
+</html>
