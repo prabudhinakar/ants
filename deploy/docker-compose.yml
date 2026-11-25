@@ -9,6 +9,8 @@ services:
       context: ..
       dockerfile: Dockerfile
     restart: unless-stopped
+    environment:
+      YT_KEY: ${YT_KEY:-}        # optional: a free Google API key turns on YouTube thumbnails in portal B
     volumes:
       - ants_data:/data
     networks: [web]
